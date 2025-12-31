@@ -1,7 +1,7 @@
 {
     "configurations": [
         {
-            "name": "demo",
+            "name": "demo1",
             "policies": [],
             "proxies": [],
             "targets": []
