@@ -1,19 +1,21 @@
 # Copyright 2025 Google LLC
 # API Proxy Validation for Pull Requests
-# - Triggers on PRs targeting 'develop'
+# - Triggers on PRs targeting 'main'
 # - Detects changed proxies under root folder: api-proxies/
+# - Posts results back to the PR
+
 name: "API Proxy Validation"
 
 on:
   pull_request:
     branches:
-      - main
+      - main  # Updated to your new default branch
     types:
       - opened
       - synchronize
       - reopened
     paths:
-      - 'api-proxies/**' # Updated to match your root folder
+      - 'api-proxies/**' # Matches your root folder name
 
 jobs:
   api-proxy-lint:
@@ -23,6 +25,7 @@ jobs:
       pull-requests: write
 
     steps:
+      # 0️⃣ Checkout
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -45,7 +48,7 @@ jobs:
             case "$f" in
               api-proxies/*/*)
                 # Matches: api-proxies/B1-Activation/...
-                # We extract the first two parts of the path
+                # Extract the first two parts: api-proxies/ProxyName
                 proxy_dir="$(echo "$f" | cut -d/ -f1-2)"
                 PROXIES_MAP["$proxy_dir"]=1
                 ;;
@@ -68,11 +71,14 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
+      # 2️⃣ Install ApigeeLint
       - name: Install ApigeeLint
         run: |
           npm install -g apigeelint
+          apigeelint -V
           mkdir -p reports
 
+      # 3️⃣ Lint Changed Proxies
       - name: Lint Changed Proxies
         id: lint
         shell: bash
@@ -82,14 +88,97 @@ jobs:
         run: |
           if [ -z "$PROXY_LIST" ]; then
             echo "No proxies to lint."
+            echo "failed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
+          FAILED=false
+          SUMMARY=""
           IFS=',' read -ra PROXIES <<< "$PROXY_LIST"
+
           for PROXY in "${PROXIES[@]}"; do
-            echo "------------------------------"
-            echo "Linting proxy: $PROXY"
-            echo "------------------------------"
-            # This will run linting on folders like 'api-proxies/B1-Activation'
-            apigeelint -s "$PROXY" -f table.js
+            echo "Linting: $PROXY"
+            safe_name=${PROXY//\//_}
+            
+            # Using --profile apigeex as per your previous setup
+            # Note: pointed directly at $PROXY folder
+            if apigeelint -s "$PROXY" -f table.js --profile apigeex | tee "reports/${safe_name}.txt"; then
+              SUMMARY+="$PROXY: ✅ Lint passed\n"
+            else
+              SUMMARY+="$PROXY: ❌ Lint failed\n"
+              FAILED=true
+            fi
+            
+            apigeelint -s "$PROXY" -f html.js --profile apigeex > "reports/${safe_name}.html" || true
           done
+
+          {
+            echo "summary<<EOF"
+            echo -e "$SUMMARY"
+            echo "EOF"
+            echo "failed=$FAILED"
+          } >> "$GITHUB_OUTPUT"
+
+      # 4️⃣ Upload Reports
+      - name: Upload Lint Reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: apigee-lint-reports
+          path: reports
+
+      # 5️⃣ Parse Reports and Comment on PR
+      - name: Parse Lint Reports and Post to PR
+        if: always()
+        shell: bash
+        run: |
+          pr_id="${{ github.event.pull_request.number }}"
+          build_url="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          
+          md="📝 **Apigee Lint Results**\n\n"
+          md+="**Build:** [#${{ github.run_id }}](${build_url})\n\n"
+          
+          md+="| Proxy Name | Errors | Warnings |\n"
+          md+="|------------|--------|----------|\n"
+
+          total_errors=0
+          total_warnings=0
+          found_any=0
+
+          for report in reports/*.txt; do
+            [ -f "$report" ] || continue
+            proxy_name=$(basename "$report" .txt | sed 's/api-proxies_//')
+            
+            # Count errors/warnings (subtracting header lines if your grep finds them)
+            errors=$(grep -i "error" "$report" | wc -l)
+            warnings=$(grep -i "warning" "$report" | wc -l)
+
+            # Adjusting counts as per your original logic
+            [ "$errors" -gt 0 ] && errors=$((errors - 1))
+            [ "$warnings" -gt 0 ] && warnings=$((warnings - 1))
+
+            total_errors=$((total_errors + errors))
+            total_warnings=$((total_warnings + warnings))
+            md+="| ${proxy_name} | ${errors} | ${warnings} |\n"
+            found_any=1
+          done
+
+          if [ "$found_any" -eq 0 ]; then
+            md+="\n_No proxy changes detected._"
+          else
+            md+="\n**Totals:**\n"
+            md+="❌ ${total_errors} Error(s) | ⚠️ ${total_warnings} Warning(s)\n"
+          fi
+
+          curl -X POST \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"body\": \"$md\"}" \
+            "${{ github.api_url }}/repos/${{ github.repository }}/issues/$pr_id/comments"
+
+      # 6️⃣ Final Failure Check
+      - name: Fail if any lint failed
+        if: steps.lint.outputs.failed == 'true'
+        run: |
+          echo "One or more proxies failed Apigee linting."
+          exit 1
