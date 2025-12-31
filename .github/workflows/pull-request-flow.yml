@@ -1,0 +1,95 @@
+# Copyright 2025 Google LLC
+# API Proxy Validation for Pull Requests
+# - Triggers on PRs targeting 'develop'
+# - Detects changed proxies under root folder: api-proxies/
+name: "API Proxy Validation"
+
+on:
+  pull_request:
+    branches:
+      - main
+    types:
+      - opened
+      - synchronize
+      - reopened
+    paths:
+      - 'api-proxies/**' # Updated to match your root folder
+
+jobs:
+  api-proxy-lint:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1️⃣ Detect changed proxies (api-proxies/ProxyName)
+      - name: Detect Changed Proxies
+        id: detect
+        shell: bash
+        run: |
+          echo "Determining changed files for PR..."
+          TGT="${{ github.base_ref }}"
+          git fetch origin "$TGT" --depth=200
+          BASE=$(git merge-base HEAD origin/$TGT)
+          
+          CHANGED_FILES=$(git diff --diff-filter=ACMRT --name-only "$BASE" HEAD || true)
+
+          declare -A PROXIES_MAP=()
+          while IFS= read -r f; do
+            case "$f" in
+              api-proxies/*/*)
+                # Matches: api-proxies/B1-Activation/...
+                # We extract the first two parts of the path
+                proxy_dir="$(echo "$f" | cut -d/ -f1-2)"
+                PROXIES_MAP["$proxy_dir"]=1
+                ;;
+            esac
+          done <<< "$CHANGED_FILES"
+
+          if [ ${#PROXIES_MAP[@]} -eq 0 ]; then
+            echo "No proxy directory changes detected."
+            echo "proxy_list=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          PROXY_LIST=$(printf "%s\n" "${!PROXIES_MAP[@]}" | sort)
+          PROXY_LIST_CSV=$(echo "$PROXY_LIST" | paste -sd',' -)
+
+          {
+            echo "proxy_list=$PROXY_LIST_CSV"
+            echo "proxy_list_pretty<<EOF"
+            echo "$PROXY_LIST"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install ApigeeLint
+        run: |
+          npm install -g apigeelint
+          mkdir -p reports
+
+      - name: Lint Changed Proxies
+        id: lint
+        shell: bash
+        continue-on-error: true
+        env:
+          PROXY_LIST: ${{ steps.detect.outputs.proxy_list }}
+        run: |
+          if [ -z "$PROXY_LIST" ]; then
+            echo "No proxies to lint."
+            exit 0
+          fi
+
+          IFS=',' read -ra PROXIES <<< "$PROXY_LIST"
+          for PROXY in "${PROXIES[@]}"; do
+            echo "------------------------------"
+            echo "Linting proxy: $PROXY"
+            echo "------------------------------"
+            # This will run linting on folders like 'api-proxies/B1-Activation'
+            apigeelint -s "$PROXY" -f table.js
+          done
