@@ -1,4 +1,4 @@
-name: "2. Apigee Deployment"
+name: "2. Apigee Deployment Complete"
 
 on:
   workflow_dispatch:
