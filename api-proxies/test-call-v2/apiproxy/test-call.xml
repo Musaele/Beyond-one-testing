@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<APIProxy revision="1" name="test-call-v1">
+  <DisplayName/>
+  <Description>test-call</Description>
+  <CreatedAt>1722937044422</CreatedAt>
+  <LastModifiedAt>1722937044422</LastModifiedAt>
+  <BasePaths>/test-call-v2</BasePaths>
+  <ProxyEndpoints>
+    <ProxyEndpoint>default</ProxyEndpoint>
+  </ProxyEndpoints>
+  <TargetEndpoints>
+    <TargetEndpoint>default</TargetEndpoint>
+  </TargetEndpoints>
+</APIProxy>

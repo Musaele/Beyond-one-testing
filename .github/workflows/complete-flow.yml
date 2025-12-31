@@ -1,0 +1,165 @@
+name: "2. Apigee Deployment"
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxy_selection:
+        description: "Choose deployment mode"
+        required: true
+        type: choice
+        default: 'USE_LATEST_COMMITTED'
+        options:
+          - USE_LATEST_COMMITTED
+          - MANUAL_INPUT
+      manual_proxy_names:
+        description: "If Manual, enter names (comma-separated)"
+        required: false
+      deploy_env:
+        description: "Target Environment"
+        required: true
+        type: choice
+        default: 'demo'
+        options:
+          - demo
+          - prod
+
+jobs:
+  DeploySelectedProxies:
+    name: Deploy Proxies
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # 1️⃣ Determine which proxies to deploy
+      - name: Resolve Proxy List
+        id: resolve
+        run: |
+          if [ "${{ github.event.inputs.proxy_selection }}" == "USE_LATEST_COMMITTED" ]; then
+            if [ ! -s "last-changed-proxies.txt" ]; then
+              echo "### ❌ Deployment Error" >> $GITHUB_STEP_SUMMARY
+              echo "The file \`last-changed-proxies.txt\` was not found. Run Detection workflow first." >> $GITHUB_STEP_SUMMARY
+              exit 1
+            fi
+            LIST=$(cat last-changed-proxies.txt)
+          else
+            LIST="${{ github.event.inputs.manual_proxy_names }}"
+          fi
+          
+          if [ -z "$(echo "$LIST" | tr -d '[:space:]')" ]; then
+            echo "❌ ERROR: manual_proxy_names is empty."
+            exit 1
+          fi
+          
+          CLEAN_LIST=$(echo "$LIST" | tr -d ' ' | sed 's/,$//')
+          echo "proxies=$CLEAN_LIST" >> $GITHUB_OUTPUT
+
+      # 2️⃣ Maven Caching
+      - name: Cache Maven Local Repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      # 3️⃣ Restore Service Account
+      - name: Restore Service Account JSON
+        run: |
+          echo "$SERVICE_ACCOUNT_BASE64" | base64 --decode > $HOME/service_account.json
+        env:
+          SERVICE_ACCOUNT_BASE64: ${{ secrets.SERVICE_ACCOUNT_BASE64 }}
+
+      # 4️⃣ Prepare Tools
+      - name: Prepare Tools
+        run: |
+          # Install xmllint (libxml2-utils) and apigeelint
+          sudo apt-get update && sudo apt-get install -y libxml2-utils
+          npm install -g apigeelint --silent
+          mkdir -p ./reports
+          mkdir -p ./integration_reports
+
+      # 5️⃣ Fetch Access Token
+      - name: Fetch Access Token
+        id: auth
+        run: |
+          chmod +x ./scripts/revision.sh
+          TOKEN=$(./scripts/revision.sh "${{ vars.ORG }}" "$HOME/service_account.json")
+          echo "access_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      # 6️⃣ Loop: Lint -> Deploy -> Integration Test
+      - name: Deploy and Test Proxies
+        env:
+          ORG: ${{ vars.ORG }}
+          APIGEE_ENVIRONMENT: ${{ github.event.inputs.deploy_env }}
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          PROXY_LIST: ${{ steps.resolve.outputs.proxies }}
+        run: |
+          IFS=',' read -ra ADDR <<< "$PROXY_LIST"
+          ANY_FAILURE=false
+
+          for PROXY in "${ADDR[@]}"; do
+            echo "------------------------------------------------------"
+            echo "🚀 Processing: $PROXY"
+            
+            # Use the correct folder prefix based on your structure
+            PROXY_PATH="api-proxies/$PROXY"
+
+            if [ ! -d "$PROXY_PATH" ]; then
+              echo "⚠️ Proxy folder '$PROXY_PATH' not found. Skipping..."
+              ANY_FAILURE=true
+              continue
+            fi
+
+            (
+              set -e 
+              echo "📌 1. Linting $PROXY..."
+              apigeelint -s "$PROXY_PATH/apiproxy" -f table.js --profile apigeex
+
+              echo "📦 2. Running Maven Deploy for $PROXY..."
+              mvn clean install \
+                -f "$PROXY_PATH/pom.xml" \
+                -B \
+                -P${APIGEE_ENVIRONMENT} \
+                -Dorg=${ORG} \
+                -Denv=${APIGEE_ENVIRONMENT} \
+                -Dbearer=${ACCESS_TOKEN}
+
+              echo "🧪 3. Running Integration Tests for $PROXY..."
+              # Fix line endings and make script executable
+              sed -i 's/\r$//' scripts/integration.sh
+              chmod +x scripts/integration.sh
+              
+              # Execute integration test
+              bash ./scripts/integration.sh "$PROXY"
+            ) || { 
+              echo "❌ ERROR: $PROXY failed at one of the steps. Moving to next proxy..."
+              ANY_FAILURE=true
+            }
+          done
+
+          if [ "$ANY_FAILURE" = true ]; then
+            echo "⚠️ Pipeline finished with one or more failures."
+            exit 1
+          fi
+
+      # 7️⃣ Publish Results
+      - name: Publish Integration Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-reports-${{ github.event.inputs.deploy_env }}
+          path: ./integration_reports/
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "### Apigee Deployment Summary 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Mode** | \`${{ github.event.inputs.proxy_selection }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ github.event.inputs.deploy_env }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Proxies** | \`${{ steps.resolve.outputs.proxies }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Status** | ${{ job.status == 'success' && '✅ Success' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY

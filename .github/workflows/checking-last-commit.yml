@@ -1,0 +1,64 @@
+name: "1. Detect and Store Changes"
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'api-proxies/**'
+
+jobs:
+  update-list:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Changed Proxies
+        id: detect
+        run: |
+          # Compare current commit with the previous one
+          # Using HEAD^ ensures we only get changes from the most recent push
+          CHANGED=$(git diff --name-only HEAD^ HEAD | grep '^api-proxies/' | cut -d/ -f2 | sort -u | tr '\n' ',' | sed 's/,$//')
+          
+          if [ -z "$CHANGED" ]; then
+            echo "No proxy changes detected."
+            echo "detected=none" >> $GITHUB_OUTPUT
+          else
+            echo "Detected: $CHANGED"
+            echo "$CHANGED" > last-changed-proxies.txt
+            echo "detected=$CHANGED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Commit and Push List
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Check if file exists and has content before adding
+          if [ -s "last-changed-proxies.txt" ]; then
+            git add last-changed-proxies.txt
+            # Only commit if the content is actually different from what's in the repo
+            if git diff --staged --quiet; then
+              echo "No changes to the proxy list file."
+            else
+              git commit -m "chore: update last changed proxies [skip ci]"
+              git push
+            fi
+          fi
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "### 🔍 Change Detection Report" >> $GITHUB_STEP_SUMMARY
+          if [ -f "last-changed-proxies.txt" ]; then
+            echo "| Status | Proxies Found |" >> $GITHUB_STEP_SUMMARY
+            echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+            echo "| ✅ Updated | \`$(cat last-changed-proxies.txt)\` |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ No changes detected in the api-proxies directory." >> $GITHUB_STEP_SUMMARY
+          fi

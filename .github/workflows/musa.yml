@@ -1,0 +1,104 @@
+name: Apigee Multi-Proxy Deployment
+
+on:
+  workflow_dispatch:
+    inputs:
+      proxies:
+        description: "Comma-separated proxy names (e.g., proxy-a, proxy-b)"
+        required: true
+        default: 'test-call'
+      deploy_env:
+        description: "Target Environment"
+        required: true
+        type: choice
+        default: 'demo'
+        options:
+          - demo
+          - prod
+
+jobs:
+  DeployProxies:
+    name: Deploy Selected Proxies
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Cache Maven Local Repo
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Restore Service Account JSON
+        run: |
+          echo "$SERVICE_ACCOUNT_BASE64" | base64 --decode > $HOME/service_account.json
+        env:
+          SERVICE_ACCOUNT_BASE64: ${{ secrets.SERVICE_ACCOUNT_BASE64 }}
+
+      - name: Prepare Tools
+        run: |
+          npm install -g apigeelint --silent
+          mkdir -p ./reports
+
+      - name: Fetch Access Token
+        id: auth
+        run: |
+          chmod +x ./scripts/revision.sh
+          TOKEN=$(./scripts/revision.sh "${{ vars.ORG }}" "$HOME/service_account.json")
+          echo "access_token=$TOKEN" >> $GITHUB_OUTPUT
+
+      # 🔄 Loop through the provided proxies
+      - name: Process and Deploy Proxies
+        env:
+          ORG: ${{ vars.ORG }}
+          APIGEE_ENVIRONMENT: ${{ github.event.inputs.deploy_env }}
+          ACCESS_TOKEN: ${{ steps.auth.outputs.access_token }}
+          # Input string like "proxy1, proxy2"
+          PROXY_INPUT: ${{ github.event.inputs.proxies }}
+        run: |
+          # Convert comma-separated string into a bash array, removing spaces
+          IFS=',' read -ra ADDR <<< "${PROXY_INPUT// /}"
+          
+          for PROXY in "${ADDR[@]}"; do
+            echo "------------------------------------------------------"
+            echo "🚀 Starting process for: $PROXY"
+            
+            # 1. Validation
+            if [ ! -d "api-proxies/$PROXY" ]; then
+              echo "❌ ERROR: Proxy '$PROXY' not found in api-proxies/! Skipping..."
+              continue
+            fi
+
+            # 2. Linting
+            echo "📌 Linting $PROXY..."
+            apigeelint -s api-proxies/$PROXY/apiproxy -f table.js --profile apigeex
+
+            # 3. Deployment
+            echo "📦 Deploying $PROXY to $APIGEE_ENVIRONMENT..."
+            mvn clean install \
+              -f api-proxies/$PROXY/pom.xml \
+              -B \
+              -P${APIGEE_ENVIRONMENT} \
+              -Dorg=${ORG} \
+              -Denv=${APIGEE_ENVIRONMENT} \
+              -Dbearer=${ACCESS_TOKEN}
+            
+            echo "✅ Finished $PROXY"
+            echo "------------------------------------------------------"
+          done
+
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "### Apigee Manual Deployment Report 🚀" >> $GITHUB_STEP_SUMMARY
+          echo "| Detail | Value |" >> $GITHUB_STEP_SUMMARY
+          echo "| --- | --- |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Proxies Requested** | \`${{ github.event.inputs.proxies }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Environment** | \`${{ github.event.inputs.deploy_env }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Final Status** | ${{ job.status == 'success' && '✅ All Processed' || '⚠️ Some items failed' }} |" >> $GITHUB_STEP_SUMMARY
